@@ -1,68 +1,64 @@
 package buffer
 
-import (
-	"errors"
+import "errors"
+
+// ErrFull is returned when the buffer is full and cannot accept more writes.
+// ErrEmpty is returned when the buffer is empty and cannot provide more reads.
+var (
+	ErrFull  = errors.New("buffer full")
+	ErrEmpty = errors.New("buffer empty")
 )
 
-var ErrEOF = errors.New("EOF")
-
-// buffer implements a generic buffer that can store any type of data.
-// It is not thread-safe and should be used with a mutex.
-// It is used by LinkedBuffer to store data and is not intended to be used directly.
+// buffer is a fixed-size chunk in a linked buffer chain.
+// It stores elements in a linear slice without wrapping indices.
+// Not thread-safe.
 type buffer[T any] struct {
-	data           []T
-	nextWriteIndex int
-	nextReadIndex  int
-	next           *buffer[T]
-	zero           T
+	data     []T
+	writeIdx int
+	readIdx  int
+	next     *buffer[T]
+	zero     T // zero value for clearing read slots
 }
 
-func newBuffer[T any](capacity int) *buffer[T] {
+// NewBuffer creates a new buffer chunk with the given capacity.
+func NewBuffer[T any](capacity int) *buffer[T] {
 	return &buffer[T]{
 		data: make([]T, capacity),
 	}
 }
 
-// Cap returns the capacity of the buffer.
+// Cap returns the capacity of this buffer chunk.
 func (b *buffer[T]) Cap() int {
 	return cap(b.data)
 }
 
-// Len returns the number of elements in the buffer.
+// Len returns the number of readable elements in this buffer chunk.
 func (b *buffer[T]) Len() int {
-	return b.nextWriteIndex - b.nextReadIndex
+	return b.writeIdx - b.readIdx
 }
 
-// Write writes a value to the buffer.
-// If the buffer is full, it returns an EOF error.
+// Write appends a value to this buffer chunk.
+// Returns ErrFull if the chunk has no remaining space.
 func (b *buffer[T]) Write(value T) error {
-	if b.nextWriteIndex >= b.Cap() {
-		// Buffer is full
-		return ErrEOF
+	if b.writeIdx >= b.Cap() {
+		return ErrFull
 	}
-
-	b.data[b.nextWriteIndex] = value
-	b.nextWriteIndex++
+	b.data[b.writeIdx] = value
+	b.writeIdx++
 	return nil
 }
 
-// Read reads a value from the buffer.
-// If the buffer is empty, it returns an EOF error.
-// If the buffer has been read completely, it returns an EOF error.
-func (b *buffer[T]) Read() (value T, err error) {
-	if b.nextReadIndex >= b.Cap() || (b.next == nil && b.nextReadIndex >= b.nextWriteIndex) {
-		// Buffer read completely, return EOF error
-		err = ErrEOF
-		return
+// Read retrieves the next value from this buffer chunk.
+// Returns ErrEmpty if no more elements are available in this chunk
+// (either fully read or empty and no next chunk).
+func (b *buffer[T]) Read() (T, error) {
+	if b.readIdx >= b.writeIdx {
+		return b.zero, ErrEmpty
 	}
-
-	value = b.data[b.nextReadIndex]
-
-	// Remove reference to read value to prevent memory leaks caused by
-	// holding references to submitted tasks.
-	// See https://github.com/alitto/pond/issues/110
-	b.data[b.nextReadIndex] = b.zero
-
-	b.nextReadIndex++
-	return
+	value := b.data[b.readIdx]
+	// Clear reference to allow GC of large elements (e.g., tasks).
+	// Reference: common practice in task queues to prevent leaks.
+	b.data[b.readIdx] = b.zero
+	b.readIdx++
+	return value, nil
 }
