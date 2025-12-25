@@ -13,8 +13,7 @@ import (
 )
 
 const (
-	// Constant for an unbounded queue
-	Unbounded               = math.MaxInt
+	Unbounded               = math.MaxInt // Unbounded queue size
 	DefaultQueueSize        = Unbounded
 	DefaultNonBlocking      = false
 	LinkedBufferInitialSize = 1024
@@ -36,130 +35,65 @@ var (
 
 // basePool is the base interface for all pool types.
 type basePool interface {
-	// Returns the number of worker goroutines that are currently active (executing a task) in the pool.
-	RunningWorkers() int64
-
-	// Returns the total number of tasks submitted to the pool since its creation.
-	SubmittedTasks() uint64
-
-	// Returns the number of tasks that are currently waiting in the pool's queue.
-	WaitingTasks() uint64
-
-	// Returns the number of tasks that have completed with an error.
-	FailedTasks() uint64
-
-	// Returns the number of tasks that have completed successfully.
-	SuccessfulTasks() uint64
-
-	// Returns the total number of tasks that have completed (either successfully or with an error).
-	CompletedTasks() uint64
-
-	// Returns the number of tasks that have been dropped because the queue was full.
-	DroppedTasks() uint64
-
-	// Returns the maximum concurrency of the pool.
-	MaxConcurrency() int
-
-	// Returns the size of the task queue.
-	QueueSize() int
-
-	// Returns true if the pool is non-blocking, meaning that it will not block when the task queue is full.
-	// In a non-blocking pool, tasks that cannot be submitted to the queue will be dropped.
-	// By default, pools are blocking, meaning that they will block when the task queue is full.
-	NonBlocking() bool
-
-	// Returns the context associated with this pool.
+	RunningWorkers() int64   // Number of active workers
+	SubmittedTasks() uint64  // Total tasks submitted
+	WaitingTasks() uint64    // Tasks waiting in queue
+	FailedTasks() uint64     // Tasks completed with error
+	SuccessfulTasks() uint64 // Tasks completed successfully
+	CompletedTasks() uint64  // Total completed tasks
+	DroppedTasks() uint64    // Tasks dropped (queue full)
+	MaxConcurrency() int     // Maximum concurrent workers
+	QueueSize() int          // Task queue size
+	NonBlocking() bool       // True if pool doesn't block on full queue
 	Context() context.Context
-
-	// Stops the pool and returns a future that can be used to wait for all tasks pending to complete.
-	// The pool will not accept new tasks after it has been stopped.
-	Stop() Task
-
-	// Stops the pool and waits for all tasks to complete.
-	StopAndWait()
-
-	// Returns true if the pool has been stopped or its context has been cancelled.
-	Stopped() bool
-
-	// Resizes the pool by changing the maximum concurrency (number of workers) of the pool.
-	// The new max concurrency must be greater than 0.
-	// If the new max concurrency is less than the current number of running workers, the pool will continue to run with the new max concurrency.
+	Stop() Task    // Stop and return future for completion
+	StopAndWait()  // Stop and wait for all tasks
+	Stopped() bool // True if stopped or context cancelled
 	Resize(maxConcurrency int)
 }
 
-// Represents a pool of goroutines that can execute tasks concurrently.
+// Pool represents a pool of goroutines that can execute tasks concurrently.
 type Pool interface {
 	basePool
-
-	// Submits a task to the pool without waiting for it to complete.
-	// The pool will not accept new tasks after it has been stopped.
-	// If the pool has been stopped, this method will return ErrPoolStopped.
+	// Go submits a task without waiting. Returns ErrPoolStopped if stopped.
 	Go(task func()) error
-
-	// Submits a task to the pool and returns a future that can be used to wait for the task to complete.
-	// The pool will not accept new tasks after it has been stopped.
-	// If the pool has been stopped, the returned future will resolve to ErrPoolStopped.
+	// Submit submits a task and returns a future.
 	Submit(task func()) Task
-
-	// Submits a task to the pool and returns a future that can be used to wait for the task to complete.
-	// The task function must return an error.
-	// The pool will not accept new tasks after it has been stopped.
-	// If the pool has been stopped, the returned future will resolve to ErrPoolStopped.
+	// SubmitErr submits a task that returns an error.
 	SubmitErr(task func() error) Task
-
-	// Attempts to submit a task to the pool and returns a future that can be used to wait for the task to complete
-	// and a boolean indicating whether the task was submitted successfully.
-	// The pool will not accept new tasks after it has been stopped.
-	// If the pool has been stopped, the returned future will resolve to ErrPoolStopped.
+	// TrySubmit attempts non-blocking submit. Returns false if queue full.
 	TrySubmit(task func()) (Task, bool)
-
-	// Attempts to submit a task to the pool and returns a future that can be used to wait for the task to complete
-	// and a boolean indicating whether the task was submitted successfully.
-	// The task function must return an error.
-	// The pool will not accept new tasks after it has been stopped.
-	// If the pool has been stopped, the returned future will resolve to ErrPoolStopped.
+	// TrySubmitErr attempts non-blocking submit for error-returning task.
 	TrySubmitErr(task func() error) (Task, bool)
-
-	// Creates a new subpool with the specified maximum concurrency and options.
+	// NewSubpool creates a child pool with specified concurrency.
 	NewSubpool(maxConcurrency int, options ...Option) Pool
-
-	// Creates a new task group.
+	// NewGroup creates a task group.
 	NewGroup() TaskGroup
-
-	// Creates a new task group with the specified context.
+	// NewGroupContext creates a task group with specified context.
 	NewGroupContext(ctx context.Context) TaskGroup
 }
 
+// Option configures a pool.
 type Option func(*pool)
 
 // WithContext sets the context for the pool.
 func WithContext(ctx context.Context) Option {
-	return func(p *pool) {
-		p.ctx = ctx
-	}
+	return func(p *pool) { p.ctx = ctx }
 }
 
-// WithQueueSize sets the max number of elements that can be queued in the pool.
+// WithQueueSize sets the max queue size.
 func WithQueueSize(size int) Option {
-	return func(p *pool) {
-		p.queueSize = size
-	}
+	return func(p *pool) { p.queueSize = size }
 }
 
-// WithNonBlocking sets the pool to be non-blocking when the queue is full.
-// This option is only effective when the queue size is set.
+// WithNonBlocking makes the pool non-blocking when queue is full.
 func WithNonBlocking(nonBlocking bool) Option {
-	return func(p *pool) {
-		p.nonBlocking = nonBlocking
-	}
+	return func(p *pool) { p.nonBlocking = nonBlocking }
 }
 
-// WithoutPanicRecovery disables panic interception inside worker goroutines.
-// When this option is enabled, panics inside tasks will propagate just like regular goroutines.
+// WithoutPanicRecovery disables panic recovery in workers.
 func WithoutPanicRecovery() Option {
-	return func(p *pool) {
-		p.panicRecovery = false
-	}
+	return func(p *pool) { p.panicRecovery = false }
 }
 
 type pool struct {
@@ -182,18 +116,23 @@ type pool struct {
 	droppedTaskCount    atomic.Uint64
 }
 
-func (p *pool) Context() context.Context {
-	return p.ctx
+func (p *pool) Context() context.Context { return p.ctx }
+func (p *pool) Stopped() bool            { return p.closed.Load() || p.ctx.Err() != nil }
+func (p *pool) QueueSize() int           { return p.queueSize }
+func (p *pool) NonBlocking() bool        { return p.nonBlocking }
+func (p *pool) RunningWorkers() int64    { return p.workerCount.Load() }
+func (p *pool) SubmittedTasks() uint64   { return p.submittedTaskCount.Load() }
+func (p *pool) WaitingTasks() uint64     { return p.tasks.Len() }
+func (p *pool) FailedTasks() uint64      { return p.failedTaskCount.Load() }
+func (p *pool) SuccessfulTasks() uint64  { return p.successfulTaskCount.Load() }
+func (p *pool) CompletedTasks() uint64 {
+	return p.successfulTaskCount.Load() + p.failedTaskCount.Load()
 }
-
-func (p *pool) Stopped() bool {
-	return p.closed.Load() || p.ctx.Err() != nil
-}
+func (p *pool) DroppedTasks() uint64 { return p.droppedTaskCount.Load() }
 
 func (p *pool) MaxConcurrency() int {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-
 	return p.maxConcurrency
 }
 
@@ -201,162 +140,86 @@ func (p *pool) Resize(maxConcurrency int) {
 	if maxConcurrency == 0 {
 		maxConcurrency = math.MaxInt
 	}
-
 	if maxConcurrency < 0 {
 		panic(errors.New("maxConcurrency must be greater than or equal to 0"))
 	}
 
 	p.mutex.Lock()
-
-	// Calculate the number of new workers to launch to reach the new max concurrency or the number of tasks in the queue, whichever is smaller
-	newWorkers := int(math.Min(float64(maxConcurrency-p.maxConcurrency), float64(p.tasks.Len())))
-
+	newWorkers := min(maxConcurrency-p.maxConcurrency, int(p.tasks.Len()))
 	p.maxConcurrency = maxConcurrency
-
 	if newWorkers > 0 {
 		p.workerCount.Add(int64(newWorkers))
 		p.workerWaitGroup.Add(newWorkers)
 	}
-
 	p.mutex.Unlock()
 
-	// Launch the new workers
-	for i := 0; i < newWorkers; i++ {
+	for range newWorkers {
 		p.launchWorker(nil)
 	}
 }
 
-func (p *pool) QueueSize() int {
-	return p.queueSize
-}
-
-func (p *pool) NonBlocking() bool {
-	return p.nonBlocking
-}
-
-func (p *pool) RunningWorkers() int64 {
-	return p.workerCount.Load()
-}
-
-func (p *pool) SubmittedTasks() uint64 {
-	return p.submittedTaskCount.Load()
-}
-
-func (p *pool) WaitingTasks() uint64 {
-	return p.tasks.Len()
-}
-
-func (p *pool) FailedTasks() uint64 {
-	return p.failedTaskCount.Load()
-}
-
-func (p *pool) SuccessfulTasks() uint64 {
-	return p.successfulTaskCount.Load()
-}
-
-func (p *pool) CompletedTasks() uint64 {
-	return p.successfulTaskCount.Load() + p.failedTaskCount.Load()
-}
-
-func (p *pool) DroppedTasks() uint64 {
-	return p.droppedTaskCount.Load()
-}
-
 func (p *pool) worker(task any) {
-	var readTaskErr, err error
 	for {
 		if task != nil {
-			_, err = invokeTask[any](task, p.panicRecovery)
-
+			_, err := invokeTask[any](task, p.panicRecovery)
 			p.updateMetrics(err)
 		}
-
-		task, readTaskErr = p.readTask()
-
-		if readTaskErr != nil {
+		var err error
+		if task, err = p.readTask(); err != nil {
 			return
 		}
 	}
 }
 
-func (p *pool) subpoolWorker(task any) func() (output any, err error) {
-	return func() (output any, err error) {
+func (p *pool) subpoolWorker(task any) func() (any, error) {
+	return func() (any, error) {
+		var out any
+		var err error
 		if task != nil {
-			output, err = invokeTask[any](task, p.panicRecovery)
-
+			out, err = invokeTask[any](task, p.panicRecovery)
 			p.updateMetrics(err)
 		}
-
-		// Attempt to submit the next task to the parent pool
-		if task, err := p.readTask(); err == nil {
-			p.parent.submit(p.subpoolWorker(task), p.nonBlocking)
+		if next, readErr := p.readTask(); readErr == nil {
+			p.parent.submit(p.subpoolWorker(next), p.nonBlocking)
 		}
-
-		return
+		return out, err
 	}
 }
 
-func (p *pool) Go(task func()) error {
-	return p.submit(task, p.nonBlocking)
-}
-
-func (p *pool) Submit(task func()) Task {
-	future, _ := p.wrapAndSubmit(task, p.nonBlocking)
-	return future
-}
-
+func (p *pool) Go(task func()) error    { return p.submit(task, p.nonBlocking) }
+func (p *pool) Submit(task func()) Task { f, _ := p.wrapAndSubmit(task, p.nonBlocking); return f }
 func (p *pool) SubmitErr(task func() error) Task {
-	future, _ := p.wrapAndSubmit(task, p.nonBlocking)
-	return future
+	f, _ := p.wrapAndSubmit(task, p.nonBlocking)
+	return f
 }
-
-func (p *pool) TrySubmit(task func()) (Task, bool) {
-	return p.wrapAndSubmit(task, true)
-}
-
-func (p *pool) TrySubmitErr(task func() error) (Task, bool) {
-	return p.wrapAndSubmit(task, true)
-}
+func (p *pool) TrySubmit(task func()) (Task, bool)          { return p.wrapAndSubmit(task, true) }
+func (p *pool) TrySubmitErr(task func() error) (Task, bool) { return p.wrapAndSubmit(task, true) }
 
 func (p *pool) wrapAndSubmit(task any, nonBlocking bool) (Task, bool) {
 	if p.Stopped() {
 		return poolStoppedFuture, false
 	}
-
-	future, wrappedTask, resolve := p.wrapTask(task)
-
-	if err := p.submit(wrappedTask, nonBlocking); err != nil {
+	f, resolve := future.NewFuture(p.ctx)
+	wrapped := wrapTask[struct{}, func(error)](task, resolve, p.panicRecovery)
+	if err := p.submit(wrapped, nonBlocking); err != nil {
 		resolve(err)
-		return future, false
+		return f, false
 	}
-
-	return future, true
+	return f, true
 }
 
-func (p *pool) wrapTask(task any) (Task, func() error, func(error)) {
-	ctx := p.Context()
-	future, resolve := future.NewFuture(ctx)
-
-	wrappedTask := wrapTask[struct{}, func(error)](task, resolve, p.panicRecovery)
-
-	return future, wrappedTask, resolve
-}
-
-func (p *pool) submit(task any, nonBlocking bool) (err error) {
-
+func (p *pool) submit(task any, nonBlocking bool) error {
 	p.submittedTaskCount.Add(1)
-
+	var err error
 	if nonBlocking {
 		err = p.trySubmit(task)
 	} else {
 		err = p.blockingTrySubmit(task)
 	}
-
 	if err != nil {
 		p.droppedTaskCount.Add(1)
 	}
-
-	return
+	return err
 }
 
 func (p *pool) blockingTrySubmit(task any) error {
@@ -364,16 +227,12 @@ func (p *pool) blockingTrySubmit(task any) error {
 		if err := p.trySubmit(task); err != ErrQueueFull {
 			return err
 		}
-
-		// No space left in the queue, wait until a slot is released
 		select {
 		case <-p.ctx.Done():
 			return p.ctx.Err()
 		case <-p.submitWaiters:
-			select {
-			case <-p.ctx.Done():
+			if p.ctx.Err() != nil {
 				return p.ctx.Err()
-			default:
 			}
 		}
 	}
@@ -381,9 +240,6 @@ func (p *pool) blockingTrySubmit(task any) error {
 
 func (p *pool) trySubmit(task any) error {
 	p.mutex.Lock()
-
-	// Check if the pool has been stopped while holding the lock
-	// to avoid race conditions on the workers wait group if the pool is being stopped.
 	if p.Stopped() {
 		p.mutex.Unlock()
 		return ErrPoolStopped
@@ -392,20 +248,16 @@ func (p *pool) trySubmit(task any) error {
 	queueEnabled := p.queueSize > 0
 	tasksLen := int(p.tasks.Len())
 
-	// When queue is enabled, check if it is full
 	if queueEnabled && tasksLen >= p.queueSize {
 		p.mutex.Unlock()
 		return ErrQueueFull
 	}
 
 	if int(p.workerCount.Load()) >= p.maxConcurrency {
-		// When queue is disabled, return an error immediately if max concurrency is reached
 		if !queueEnabled {
 			p.mutex.Unlock()
 			return ErrQueueFull
 		}
-
-		// If queue is enabled, push the task at the back of the queue
 		p.tasks.Write(task)
 		p.mutex.Unlock()
 		return nil
@@ -415,89 +267,61 @@ func (p *pool) trySubmit(task any) error {
 	p.workerWaitGroup.Add(1)
 
 	if queueEnabled && tasksLen > 0 {
-		// Push the task at the back of the queue
 		p.tasks.Write(task)
-
-		// Pop the front task
 		task, _ = p.tasks.Read()
 	}
-
 	p.mutex.Unlock()
 
 	p.launchWorker(task)
-
-	// Notify a submit waiter there is room in the queue for a new task
 	p.notifySubmitWaiter()
-
 	return nil
 }
 
 func (p *pool) launchWorker(task any) {
 	if p.parent == nil {
-		// Launch a new worker to execute the task
 		go p.worker(task)
 	} else {
-		// Submit task to the parent pool wrapped in a function that will
-		// submit the next task to the parent pool when it completes (subpool worker)
 		p.parent.submit(p.subpoolWorker(task), p.nonBlocking)
 	}
 }
 
-func (p *pool) readTask() (task any, err error) {
+func (p *pool) readTask() (any, error) {
 	p.mutex.Lock()
 
-	// Check if the pool context has been cancelled
 	select {
 	case <-p.ctx.Done():
-		// Context cancelled, worker will exit
 		p.workerCount.Add(-1)
 		p.workerWaitGroup.Done()
 		p.mutex.Unlock()
-
-		err = p.ctx.Err()
-		return
+		return nil, p.ctx.Err()
 	default:
 	}
 
 	if p.tasks.Len() == 0 {
-		// No more tasks in the queue, worker will exit
 		p.workerCount.Add(-1)
 		p.workerWaitGroup.Done()
 		p.mutex.Unlock()
-
-		// Notify a submit waiter there is room in the queue for a new task
 		p.notifySubmitWaiter()
-
-		err = ErrQueueEmpty
-		return
+		return nil, ErrQueueEmpty
 	}
 
 	if p.maxConcurrency > 0 && int(p.workerCount.Load()) > p.maxConcurrency {
-		// Max concurrency reached, kill the worker
 		p.workerCount.Add(-1)
 		p.workerWaitGroup.Done()
 		p.mutex.Unlock()
-
-		err = ErrMaxConcurrencyReached
-		return
+		return nil, ErrMaxConcurrencyReached
 	}
 
-	task, _ = p.tasks.Read()
-
+	task, _ := p.tasks.Read()
 	p.mutex.Unlock()
-
-	// Notify a submit waiter there is room in the queue for a new task
 	p.notifySubmitWaiter()
-
-	return
+	return task, nil
 }
 
 func (p *pool) notifySubmitWaiter() {
-	// Wake up one of the waiters (if any)
 	select {
 	case p.submitWaiters <- struct{}{}:
 	default:
-		return
 	}
 }
 
@@ -511,88 +335,65 @@ func (p *pool) updateMetrics(err error) {
 
 func (p *pool) Stop() Task {
 	return Submit(func() {
-		// Stop accepting new tasks while holding the lock to avoid race conditions.
 		p.mutex.Lock()
 		p.closed.Store(true)
 		p.mutex.Unlock()
-
-		// Wait for all workers to finish executing all tasks (including the ones in the queue)
 		p.workerWaitGroup.Wait()
-
-		// Cancel the context with a pool stopped error to signal that the pool has been stopped
 		p.cancel(ErrPoolStopped)
 	})
 }
 
-func (p *pool) StopAndWait() {
-	p.Stop().Wait()
-}
+func (p *pool) StopAndWait() { p.Stop().Wait() }
 
 func (p *pool) NewSubpool(maxConcurrency int, options ...Option) Pool {
 	return newPool(maxConcurrency, p, options...)
 }
-
-func (p *pool) NewGroup() TaskGroup {
-	return newTaskGroup(p, p.ctx)
-}
-
-func (p *pool) NewGroupContext(ctx context.Context) TaskGroup {
-	return newTaskGroup(p, ctx)
-}
+func (p *pool) NewGroup() TaskGroup                           { return newTaskGroup(p, p.ctx) }
+func (p *pool) NewGroupContext(ctx context.Context) TaskGroup { return newTaskGroup(p, ctx) }
 
 func newPool(maxConcurrency int, parent *pool, options ...Option) *pool {
-
 	if parent != nil {
 		if maxConcurrency > parent.MaxConcurrency() {
 			panic(fmt.Errorf("maxConcurrency cannot be greater than the parent pool's maxConcurrency (%d)", parent.MaxConcurrency()))
 		}
-
 		if maxConcurrency == 0 {
 			maxConcurrency = parent.MaxConcurrency()
 		}
 	}
-
 	if maxConcurrency == 0 {
 		maxConcurrency = math.MaxInt
 	}
-
 	if maxConcurrency < 0 {
 		panic(errors.New("maxConcurrency must be greater than or equal to 0"))
 	}
 
-	pool := &pool{
+	p := &pool{
 		ctx:            context.Background(),
 		nonBlocking:    DefaultNonBlocking,
 		panicRecovery:  true,
 		maxConcurrency: maxConcurrency,
 		queueSize:      DefaultQueueSize,
-		// Buffer size of 1 to prevent deadlock when read on the submitWaiters channel happens
-		// after the write on the same channel in the notifySubmitWaiter method.
-		// See https://github.com/alitto/pond/issues/108
-		submitWaiters: make(chan struct{}, 1),
+		submitWaiters:  make(chan struct{}, 1), // buffer 1 to prevent deadlock
 	}
 
 	if parent != nil {
-		pool.parent = parent
-		pool.ctx = parent.Context()
-		pool.queueSize = parent.queueSize
-		pool.nonBlocking = parent.nonBlocking
-		pool.panicRecovery = parent.panicRecovery
+		p.parent = parent
+		p.ctx = parent.ctx
+		p.queueSize = parent.queueSize
+		p.nonBlocking = parent.nonBlocking
+		p.panicRecovery = parent.panicRecovery
 	}
 
-	for _, option := range options {
-		option(pool)
+	for _, opt := range options {
+		opt(p)
 	}
 
-	pool.ctx, pool.cancel = context.WithCancelCause(pool.ctx)
-
-	pool.tasks = buffer.NewLinkedBuffer[any](LinkedBufferInitialSize, LinkedBufferMaxCapacity)
-
-	return pool
+	p.ctx, p.cancel = context.WithCancelCause(p.ctx)
+	p.tasks = buffer.NewLinkedBuffer[any](LinkedBufferInitialSize, LinkedBufferMaxCapacity)
+	return p
 }
 
-// NewPool creates a new pool with the given maximum concurrency and options.
-// The new maximum concurrency must be greater than or equal to 0 (0 means no limit).
+// NewPool creates a pool with the given max concurrency (0 = unlimited).
 func NewPool(maxConcurrency int, options ...Option) Pool {
 	return newPool(maxConcurrency, nil, options...)
 }
