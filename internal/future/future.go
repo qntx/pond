@@ -1,58 +1,64 @@
 package future
 
-import (
-	"context"
-)
+import "context"
 
+// FutureResolver completes a Future. Call with nil for success, non-nil for failure.
+// Must be called exactly once; subsequent calls are no-ops (context already canceled).
 type FutureResolver func(err error)
 
-// A Future represents a value that will be available in the Future.
-// It is always associated with a context that can be used to wait for the value to be available.
-// When the parent context is canceled, the Future will be canceled as well.
+// futureResolution wraps the result to distinguish from parent context cancellation.
+type futureResolution struct{ err error }
+
+func (r *futureResolution) Error() string {
+	if r.err != nil {
+		return r.err.Error()
+	}
+	return "success"
+}
+
+// Future represents an asynchronous operation that resolves to success or failure.
+// When the parent context is canceled before resolution, the Future is also canceled.
 type Future struct {
 	ctx context.Context
 }
 
+// NewFuture creates a Future bound to the parent context.
+// Returns the Future and a resolver function that must be called exactly once.
+func NewFuture(parent context.Context) (*Future, FutureResolver) {
+	ctx, cancel := context.WithCancelCause(parent)
+	return &Future{ctx: ctx}, func(err error) {
+		cancel(&futureResolution{err: err})
+	}
+}
+
+// Done returns a channel closed when the Future resolves or the parent context cancels.
 func (f *Future) Done() <-chan struct{} {
 	return f.ctx.Done()
 }
 
+// Err blocks until resolution and returns the result.
+// Returns nil on success, the task error on failure, or the parent's cause if canceled externally.
 func (f *Future) Err() error {
 	<-f.ctx.Done()
-
 	cause := context.Cause(f.ctx)
-	if cause != nil {
-		if resolution, ok := cause.(*futureResolution); ok {
-			return resolution.err
-		}
+	if r, ok := cause.(*futureResolution); ok {
+		return r.err
 	}
 	return cause
 }
 
-// Wait waits for the future to complete and returns any error that occurred.
+// Wait is an alias for Err.
 func (f *Future) Wait() error {
 	return f.Err()
 }
 
-func NewFuture(ctx context.Context) (*Future, FutureResolver) {
-	childCtx, cancel := context.WithCancelCause(ctx)
-	future := &Future{
-		ctx: childCtx,
+// Resolved reports whether the Future completed via its resolver (not external cancellation).
+func (f *Future) Resolved() bool {
+	select {
+	case <-f.ctx.Done():
+		_, ok := context.Cause(f.ctx).(*futureResolution)
+		return ok
+	default:
+		return false
 	}
-	return future, func(err error) {
-		cancel(&futureResolution{
-			err: err,
-		})
-	}
-}
-
-type futureResolution struct {
-	err error
-}
-
-func (v *futureResolution) Error() string {
-	if v.err != nil {
-		return v.err.Error()
-	}
-	return "future resolved"
 }
