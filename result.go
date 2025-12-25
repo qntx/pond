@@ -6,6 +6,14 @@ import (
 	"github.com/qntx/pond/internal/future"
 )
 
+// ResultTask represents a task that yields a result. If the task fails, the error can be retrieved.
+type ResultTask[R any] interface {
+	// Done returns a channel that is closed when the task is complete or has failed.
+	Done() <-chan struct{}
+	// Wait waits for the task to complete and returns the result and any error that occurred.
+	Wait() (R, error)
+}
+
 // ResultPool is a pool for tasks that return a result.
 type ResultPool[R any] interface {
 	basePool

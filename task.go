@@ -6,6 +6,14 @@ import (
 	"runtime/debug"
 )
 
+// Task represents a task that can be waited on. If the task fails, the error can be retrieved.
+type Task interface {
+	// Done returns a channel that is closed when the task is complete or has failed.
+	Done() <-chan struct{}
+	// Wait waits for the task to complete and returns any error that occurred.
+	Wait() error
+}
+
 // ErrPanic is returned when a task panics and panic recovery is enabled.
 var ErrPanic = errors.New("task panicked")
 
