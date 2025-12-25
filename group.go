@@ -9,75 +9,56 @@ import (
 	"github.com/qntx/pond/internal/future"
 )
 
+// ErrGroupStopped is returned when a task group is stopped.
 var ErrGroupStopped = errors.New("task group stopped")
 
 // TaskGroup represents a group of tasks that can be executed concurrently.
 // The group can be waited on to block until all tasks have completed.
-// If any of the tasks return an error, the group will return the first error encountered.
+// If any task returns an error, the group returns the first error encountered.
 type TaskGroup interface {
-
-	// Submits a task to the group.
+	// Submit submits tasks to the group.
 	Submit(tasks ...func()) TaskGroup
-
-	// Submits a task to the group that can return an error.
+	// SubmitErr submits tasks that can return an error.
 	SubmitErr(tasks ...func() error) TaskGroup
-
-	// Waits for all tasks in the group to complete.
-	// If any of the tasks return an error, the group will return the first error encountered.
-	// If the context is cancelled, the group will return the context error.
-	// If the group is stopped, the group will return ErrGroupStopped.
-	// If a task is running when the context is cancelled or the group is stopped, the task will be allowed to complete before returning.
+	// Wait blocks until all tasks complete. Returns first error if any.
 	Wait() error
-
-	// Returns a channel that is closed when all tasks in the group have completed, a task returns an error, or the group is stopped.
+	// Done returns a channel closed when all tasks complete or on error/stop.
 	Done() <-chan struct{}
-
-	// Stops the group and cancels all remaining tasks. Running tasks are not interrupted.
+	// Stop cancels remaining tasks. Running tasks are not interrupted.
 	Stop()
-
-	// Returns the context associated with this group.
-	// This context will be cancelled when either the parent context is cancelled
-	// or any task in the group returns an error, whichever comes first.
+	// Context returns the group's context, canceled on error or parent cancel.
 	Context() context.Context
 }
 
-// ResultTaskGroup represents a group of tasks that can be executed concurrently.
-// As opposed to TaskGroup, the tasks in a ResultTaskGroup yield a result.
+// ResultTaskGroup represents a group of tasks that yield results.
 // The group can be waited on to block until all tasks have completed.
-// If any of the tasks return an error, the group will return the first error encountered.
+// If any task returns an error, the group returns the first error encountered.
 type ResultTaskGroup[O any] interface {
-
-	// Submits a task to the group.
+	// Submit submits tasks to the group.
 	Submit(tasks ...func() O) ResultTaskGroup[O]
-
-	// Submits a task to the group that can return an error.
+	// SubmitErr submits tasks that can return an error.
 	SubmitErr(tasks ...func() (O, error)) ResultTaskGroup[O]
-
-	// Waits for all tasks in the group to complete and returns the results of each task in the order they were submitted.
-	// If any of the tasks return an error, the group will return the first error encountered.
-	// If the context is cancelled, the group will return the context error.
-	// If the group is stopped, the group will return ErrGroupStopped.
-	// If a task is running when the context is cancelled or the group is stopped, the task will be allowed to complete before returning.
+	// Wait blocks until all tasks complete. Returns results in submission order.
 	Wait() ([]O, error)
-
-	// Returns a channel that is closed when all tasks in the group have completed, a task returns an error, or the group is stopped.
+	// Done returns a channel closed when all tasks complete or on error/stop.
 	Done() <-chan struct{}
-
-	// Stops the group and cancels all remaining tasks. Running tasks are not interrupted.
+	// Stop cancels remaining tasks. Running tasks are not interrupted.
 	Stop()
 }
 
+// result holds a task's output and error.
 type result[O any] struct {
 	Output O
 	Err    error
 }
 
+// abstractTaskGroup is the generic base for task groups.
 type abstractTaskGroup[T func() | func() O, E func() error | func() (O, error), O any] struct {
-	pool           *pool
-	nextIndex      atomic.Int64
-	taskWaitGroup  sync.WaitGroup
-	future         *future.CompositeFuture[*result[O]]
-	futureResolver future.CompositeFutureResolver[*result[O]]
+	pool      *pool
+	nextIndex atomic.Int64
+	wg        sync.WaitGroup
+	future    *future.CompositeFuture[*result[O]]
+	resolve   future.CompositeFutureResolver[*result[O]]
 }
 
 func (g *abstractTaskGroup[T, E, O]) Done() <-chan struct{} {
@@ -96,7 +77,6 @@ func (g *abstractTaskGroup[T, E, O]) Submit(tasks ...T) *abstractTaskGroup[T, E,
 	for _, task := range tasks {
 		g.submit(task)
 	}
-
 	return g
 }
 
@@ -104,46 +84,34 @@ func (g *abstractTaskGroup[T, E, O]) SubmitErr(tasks ...E) *abstractTaskGroup[T,
 	for _, task := range tasks {
 		g.submit(task)
 	}
-
 	return g
 }
 
 func (g *abstractTaskGroup[T, E, O]) submit(task any) {
 	index := int(g.nextIndex.Add(1) - 1)
-
-	g.taskWaitGroup.Add(1)
+	g.wg.Add(1)
 
 	err := g.pool.submit(func() error {
-		defer g.taskWaitGroup.Done()
+		defer g.wg.Done()
 
-		// Check if the context has been cancelled to prevent running tasks that are not needed
+		// Skip if context already canceled
 		if err := g.future.Context().Err(); err != nil {
-			g.futureResolver(index, &result[O]{
-				Err: err,
-			}, err)
+			g.resolve(index, &result[O]{Err: err}, err)
 			return err
 		}
 
-		// Invoke the task
 		output, err := invokeTask[O](task, g.pool.panicRecovery)
-
-		g.futureResolver(index, &result[O]{
-			Output: output,
-			Err:    err,
-		}, err)
-
+		g.resolve(index, &result[O]{Output: output, Err: err}, err)
 		return err
 	}, g.pool.nonBlocking)
 
 	if err != nil {
-		g.taskWaitGroup.Done()
-
-		g.futureResolver(index, &result[O]{
-			Err: err,
-		}, err)
+		g.wg.Done()
+		g.resolve(index, &result[O]{Err: err}, err)
 	}
 }
 
+// taskGroup implements TaskGroup.
 type taskGroup struct {
 	abstractTaskGroup[func(), func() error, struct{}]
 }
@@ -160,12 +128,11 @@ func (g *taskGroup) SubmitErr(tasks ...func() error) TaskGroup {
 
 func (g *taskGroup) Wait() error {
 	_, err := g.future.Wait(int(g.nextIndex.Load()))
-	// This wait group could reach zero before the future is resolved if called in between tasks being submitted and the future being resolved.
-	// That's why we wait for the future to be resolved before waiting for the wait group.
-	g.taskWaitGroup.Wait()
+	g.wg.Wait() // ensure all tasks finish before returning
 	return err
 }
 
+// resultTaskGroup implements ResultTaskGroup.
 type resultTaskGroup[O any] struct {
 	abstractTaskGroup[func() O, func() (O, error), O]
 }
@@ -182,42 +149,35 @@ func (g *resultTaskGroup[O]) SubmitErr(tasks ...func() (O, error)) ResultTaskGro
 
 func (g *resultTaskGroup[O]) Wait() ([]O, error) {
 	results, err := g.future.Wait(int(g.nextIndex.Load()))
-
-	// This wait group could reach zero before the future is resolved if called in between tasks being submitted and the future being resolved.
-	// That's why we wait for the future to be resolved before waiting for the wait group.
-	g.taskWaitGroup.Wait()
+	g.wg.Wait() // ensure all tasks finish before returning
 
 	values := make([]O, len(results))
-
-	for i, result := range results {
-		if result != nil {
-			values[i] = result.Output
+	for i, r := range results {
+		if r != nil {
+			values[i] = r.Output
 		}
 	}
-
 	return values, err
 }
 
 func newTaskGroup(pool *pool, ctx context.Context) TaskGroup {
-	future, futureResolver := future.NewCompositeFuture[*result[struct{}]](ctx)
-
+	f, resolve := future.NewCompositeFuture[*result[struct{}]](ctx)
 	return &taskGroup{
 		abstractTaskGroup: abstractTaskGroup[func(), func() error, struct{}]{
-			pool:           pool,
-			future:         future,
-			futureResolver: futureResolver,
+			pool:    pool,
+			future:  f,
+			resolve: resolve,
 		},
 	}
 }
 
 func newResultTaskGroup[O any](pool *pool, ctx context.Context) ResultTaskGroup[O] {
-	future, futureResolver := future.NewCompositeFuture[*result[O]](ctx)
-
+	f, resolve := future.NewCompositeFuture[*result[O]](ctx)
 	return &resultTaskGroup[O]{
 		abstractTaskGroup: abstractTaskGroup[func() O, func() (O, error), O]{
-			pool:           pool,
-			future:         future,
-			futureResolver: futureResolver,
+			pool:    pool,
+			future:  f,
+			resolve: resolve,
 		},
 	}
 }
