@@ -27,9 +27,9 @@ var (
 	ErrMaxConcurrencyReached = errors.New("max concurrency reached")
 
 	poolStoppedFuture = func() Task {
-		future, resolve := future.NewFuture(context.Background())
+		f, resolve := future.NewFuture(context.Background())
 		resolve(ErrPoolStopped)
-		return future
+		return f
 	}()
 )
 
@@ -116,6 +116,17 @@ type pool struct {
 	droppedTaskCount    atomic.Uint64
 }
 
+// NewPool creates a pool with the given max concurrency (0 = unlimited).
+func NewPool(maxConcurrency int, options ...Option) Pool {
+	return newPool(maxConcurrency, nil, options...)
+}
+
+func (p *pool) NewSubpool(maxConcurrency int, options ...Option) Pool {
+	return newPool(maxConcurrency, p, options...)
+}
+func (p *pool) NewGroup() TaskGroup                           { return newTaskGroup(p, p.ctx) }
+func (p *pool) NewGroupContext(ctx context.Context) TaskGroup { return newTaskGroup(p, ctx) }
+
 func (p *pool) Context() context.Context { return p.ctx }
 func (p *pool) Stopped() bool            { return p.closed.Load() || p.ctx.Err() != nil }
 func (p *pool) QueueSize() int           { return p.queueSize }
@@ -129,6 +140,7 @@ func (p *pool) CompletedTasks() uint64 {
 	return p.successfulTaskCount.Load() + p.failedTaskCount.Load()
 }
 func (p *pool) DroppedTasks() uint64 { return p.droppedTaskCount.Load() }
+func (p *pool) StopAndWait()         { p.Stop().Wait() }
 
 func (p *pool) MaxConcurrency() int {
 	p.mutex.Lock()
@@ -158,34 +170,6 @@ func (p *pool) Resize(maxConcurrency int) {
 	}
 }
 
-func (p *pool) worker(task any) {
-	for {
-		if task != nil {
-			_, err := invokeTask[any](task, p.panicRecovery)
-			p.updateMetrics(err)
-		}
-		var err error
-		if task, err = p.readTask(); err != nil {
-			return
-		}
-	}
-}
-
-func (p *pool) subpoolWorker(task any) func() (any, error) {
-	return func() (any, error) {
-		var out any
-		var err error
-		if task != nil {
-			out, err = invokeTask[any](task, p.panicRecovery)
-			p.updateMetrics(err)
-		}
-		if next, readErr := p.readTask(); readErr == nil {
-			p.parent.submit(p.subpoolWorker(next), p.nonBlocking)
-		}
-		return out, err
-	}
-}
-
 func (p *pool) Go(task func()) error    { return p.submit(task, p.nonBlocking) }
 func (p *pool) Submit(task func()) Task { f, _ := p.wrapAndSubmit(task, p.nonBlocking); return f }
 func (p *pool) SubmitErr(task func() error) Task {
@@ -194,6 +178,58 @@ func (p *pool) SubmitErr(task func() error) Task {
 }
 func (p *pool) TrySubmit(task func()) (Task, bool)          { return p.wrapAndSubmit(task, true) }
 func (p *pool) TrySubmitErr(task func() error) (Task, bool) { return p.wrapAndSubmit(task, true) }
+
+func (p *pool) Stop() Task {
+	return Submit(func() {
+		p.mutex.Lock()
+		p.closed.Store(true)
+		p.mutex.Unlock()
+		p.workerWaitGroup.Wait()
+		p.cancel(ErrPoolStopped)
+	})
+}
+
+func newPool(maxConcurrency int, parent *pool, options ...Option) *pool {
+	if parent != nil {
+		if maxConcurrency > parent.MaxConcurrency() {
+			panic(fmt.Errorf("maxConcurrency cannot be greater than the parent pool's maxConcurrency (%d)", parent.MaxConcurrency()))
+		}
+		if maxConcurrency == 0 {
+			maxConcurrency = parent.MaxConcurrency()
+		}
+	}
+	if maxConcurrency == 0 {
+		maxConcurrency = math.MaxInt
+	}
+	if maxConcurrency < 0 {
+		panic(errors.New("maxConcurrency must be greater than or equal to 0"))
+	}
+
+	p := &pool{
+		ctx:            context.Background(),
+		nonBlocking:    DefaultNonBlocking,
+		panicRecovery:  true,
+		maxConcurrency: maxConcurrency,
+		queueSize:      DefaultQueueSize,
+		submitWaiters:  make(chan struct{}, 1), // buffer 1 to prevent deadlock
+	}
+
+	if parent != nil {
+		p.parent = parent
+		p.ctx = parent.ctx
+		p.queueSize = parent.queueSize
+		p.nonBlocking = parent.nonBlocking
+		p.panicRecovery = parent.panicRecovery
+	}
+
+	for _, opt := range options {
+		opt(p)
+	}
+
+	p.ctx, p.cancel = context.WithCancelCause(p.ctx)
+	p.tasks = buffer.NewLinkedBuffer[any](LinkedBufferInitialSize, LinkedBufferMaxCapacity)
+	return p
+}
 
 func (p *pool) wrapAndSubmit(task any, nonBlocking bool) (Task, bool) {
 	if p.Stopped() {
@@ -285,6 +321,34 @@ func (p *pool) launchWorker(task any) {
 	}
 }
 
+func (p *pool) worker(task any) {
+	for {
+		if task != nil {
+			_, err := invokeTask[any](task, p.panicRecovery)
+			p.updateMetrics(err)
+		}
+		var err error
+		if task, err = p.readTask(); err != nil {
+			return
+		}
+	}
+}
+
+func (p *pool) subpoolWorker(task any) func() (any, error) {
+	return func() (any, error) {
+		var out any
+		var err error
+		if task != nil {
+			out, err = invokeTask[any](task, p.panicRecovery)
+			p.updateMetrics(err)
+		}
+		if next, readErr := p.readTask(); readErr == nil {
+			p.parent.submit(p.subpoolWorker(next), p.nonBlocking)
+		}
+		return out, err
+	}
+}
+
 func (p *pool) readTask() (any, error) {
 	p.mutex.Lock()
 
@@ -331,69 +395,4 @@ func (p *pool) updateMetrics(err error) {
 	} else {
 		p.successfulTaskCount.Add(1)
 	}
-}
-
-func (p *pool) Stop() Task {
-	return Submit(func() {
-		p.mutex.Lock()
-		p.closed.Store(true)
-		p.mutex.Unlock()
-		p.workerWaitGroup.Wait()
-		p.cancel(ErrPoolStopped)
-	})
-}
-
-func (p *pool) StopAndWait() { p.Stop().Wait() }
-
-func (p *pool) NewSubpool(maxConcurrency int, options ...Option) Pool {
-	return newPool(maxConcurrency, p, options...)
-}
-func (p *pool) NewGroup() TaskGroup                           { return newTaskGroup(p, p.ctx) }
-func (p *pool) NewGroupContext(ctx context.Context) TaskGroup { return newTaskGroup(p, ctx) }
-
-func newPool(maxConcurrency int, parent *pool, options ...Option) *pool {
-	if parent != nil {
-		if maxConcurrency > parent.MaxConcurrency() {
-			panic(fmt.Errorf("maxConcurrency cannot be greater than the parent pool's maxConcurrency (%d)", parent.MaxConcurrency()))
-		}
-		if maxConcurrency == 0 {
-			maxConcurrency = parent.MaxConcurrency()
-		}
-	}
-	if maxConcurrency == 0 {
-		maxConcurrency = math.MaxInt
-	}
-	if maxConcurrency < 0 {
-		panic(errors.New("maxConcurrency must be greater than or equal to 0"))
-	}
-
-	p := &pool{
-		ctx:            context.Background(),
-		nonBlocking:    DefaultNonBlocking,
-		panicRecovery:  true,
-		maxConcurrency: maxConcurrency,
-		queueSize:      DefaultQueueSize,
-		submitWaiters:  make(chan struct{}, 1), // buffer 1 to prevent deadlock
-	}
-
-	if parent != nil {
-		p.parent = parent
-		p.ctx = parent.ctx
-		p.queueSize = parent.queueSize
-		p.nonBlocking = parent.nonBlocking
-		p.panicRecovery = parent.panicRecovery
-	}
-
-	for _, opt := range options {
-		opt(p)
-	}
-
-	p.ctx, p.cancel = context.WithCancelCause(p.ctx)
-	p.tasks = buffer.NewLinkedBuffer[any](LinkedBufferInitialSize, LinkedBufferMaxCapacity)
-	return p
-}
-
-// NewPool creates a pool with the given max concurrency (0 = unlimited).
-func NewPool(maxConcurrency int, options ...Option) Pool {
-	return newPool(maxConcurrency, nil, options...)
 }
