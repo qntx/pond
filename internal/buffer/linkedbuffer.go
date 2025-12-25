@@ -19,6 +19,9 @@ type LinkedBuffer[T any] struct {
 
 // NewLinkedBuffer creates a LinkedBuffer with initial and max chunk capacity.
 func NewLinkedBuffer[T any](initCap, maxCap int) *LinkedBuffer[T] {
+	if initCap <= 0 {
+		initCap = 16
+	}
 	if maxCap < initCap {
 		maxCap = initCap
 	}
